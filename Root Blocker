@@ -1,0 +1,166 @@
+
+
+SET NOCOUNT ON;
+USE tempdb;
+
+DROP TABLE IF EXISTS #block_info;
+GO
+
+-- Create an empty temp table to hold our blocking info
+CREATE TABLE #block_info (
+     block_role NVARCHAR(15),			/* Lead Blocker or Blocked */
+     database_name NVARCHAR(128),
+     session_id SMALLINT,
+     blocking_session_id SMALLINT,		
+     [host_name] NVARCHAR(128),			
+     [program_name] NVARCHAR(128),
+     original_login_name NVARCHAR(128),
+     reads BIGINT,
+     writes BIGINT,
+     cpu_time INT,
+     wait_sec INT,						/* how long a process has been waiting */
+     total_elapsed_sec INT,				/* how long since a process began execution */
+     blocking_sec INT,					/* how long the process has been blocking */
+     wait_resource NVARCHAR(256),		/* what the waiting process is waiting for */
+     text NVARCHAR(MAX)					/* the process's SQL text */
+    );
+GO
+
+-- Gather information about blocked processes and their blockers
+-- Keep in mind that "blocking" is just normal locking/waiting that
+-- has persisted too long.  How long is too long depends on the 
+-- perceptions of database users and your knowledge of what's "normal"
+-- for a system.
+INSERT  INTO #block_info ( block_role, database_name, session_id,
+                           blocking_session_id, [host_name], [program_name],
+                           original_login_name, reads, writes, cpu_time,
+                           wait_sec, total_elapsed_sec, blocking_sec,
+                           wait_resource, text )
+        SELECT  'Blocked', DB_NAME(er.database_id), er.session_id,
+                er.blocking_session_id AS 'blocking_session_id',
+                es.[host_name], es.[program_name], es.original_login_name,
+                er.reads, er.writes, er.cpu_time,
+                er.wait_time / 1000 AS 'wait_sec',
+                er.total_elapsed_time / 1000 AS 'total_elapsed_sec',
+                CAST(0 AS INT) AS 'blocking_sec', er.wait_resource, st.text
+        FROM    sys.dm_exec_sessions es
+                LEFT JOIN sys.dm_exec_requests er ON es.session_id = er.session_id
+                OUTER APPLY sys.dm_exec_sql_text(er.sql_handle) st
+        WHERE   er.blocking_session_id > 0
+        UNION
+        SELECT  'Lead Blocker', DB_NAME(er.database_id), es.session_id,
+                ISNULL(er.blocking_session_id, 0) AS 'blocking_session_id',
+                es.[host_name], es.[program_name], es.original_login_name,
+                es.reads, es.writes, es.cpu_time, er.wait_time AS 'wait_sec',
+                er.total_elapsed_time / 1000 AS 'total_elapsed_sec',
+                CAST(0 AS INT) AS 'blocking_sec', er.wait_resource, st.text
+        FROM    sys.dm_exec_sessions es
+                LEFT JOIN sys.dm_exec_requests er ON es.session_id = er.session_id
+                OUTER APPLY sys.dm_exec_sql_text(er.sql_handle) st
+        WHERE   es.session_id IN ( SELECT   blocking_session_id
+                                   FROM     sys.dm_exec_requests
+                                   WHERE    blocking_session_id > 0 )
+                AND ISNULL(er.blocking_session_id, 0) = 0
+        ORDER BY blocking_session_id, wait_sec DESC; 
+GO						   
+
+-- If we couldn't retrieve T-SQL for a current request (eg, if an UPDATE in a 
+-- transaction ran but was never committed or rolled back), try to grab the 
+-- text of the last batch executed by the session and use the connection time to 
+-- calculate total_elapsed_time .  Prefix the SQL text with "[Last]".
+UPDATE  #block_info
+SET     text = N'[Last] ' + st.text,
+        total_elapsed_sec = DATEDIFF(SECOND, ec.connect_time, GETDATE())
+FROM    #block_info b
+        INNER  JOIN sys.dm_exec_connections ec ON b.session_id = ec.session_id
+        CROSS APPLY sys.dm_exec_sql_text(ec.most_recent_sql_handle) st
+WHERE   b.text IS NULL;
+GO
+
+WITH    blocked_time_by_session
+          AS ( SELECT   blocking_session_id, MAX(wait_sec) AS 'max_wait'
+               FROM     #block_info
+               WHERE    blocking_session_id > 0
+               GROUP BY blocking_session_id
+             )
+    UPDATE  #block_info
+    SET     blocking_sec = t.max_wait
+    FROM    blocked_time_by_session t
+            INNER JOIN #block_info b ON t.blocking_session_id = b.session_id 
+
+-- See what we've got
+SELECT   block_role, database_name, session_id, blocking_session_id, host_name,
+        program_name, original_login_name, reads, writes, cpu_time, wait_sec,
+        total_elapsed_sec, blocking_sec, wait_resource, text
+FROM    #block_info;
+GO
+
+/***************************************************************************************/
+
+-- When troubleshooting blocking issues it's sometimes helpful to see all the locks
+-- being held by the involved session ids (and what locks they're waiting to acquire)
+DECLARE block_processes CURSOR
+FOR
+    SELECT  session_id
+    FROM    #block_info 
+	FOR READ ONLY;
+GO
+
+DECLARE @session_id SMALLINT;
+		
+-- Open the cursor and retrieve the first value(s)
+OPEN block_processes;
+FETCH block_processes INTO @session_id;
+
+WHILE ( @@fetch_status = 0 )
+BEGIN
+    SELECT  l.request_session_id, DB_NAME(l.resource_database_id) AS 'database', 
+			l.resource_type, l.resource_description, l.request_mode, 
+			l.resource_associated_entity_id, l.request_status
+    FROM    sys.dm_tran_locks l
+            INNER JOIN #block_info b ON l.request_session_id = b.session_id
+    WHERE   l.resource_type NOT IN ( 'DATABASE', 'METADATA' ) AND
+            l.request_session_id = @session_id
+    ORDER BY l.request_session_id, CASE l.resource_type
+                                        WHEN 'OBJECT' THEN 1
+                                        WHEN 'PAGE' THEN 2
+                                        WHEN 'KEY' THEN 3
+                                    END 
+
+    FETCH block_processes INTO @session_id;
+END
+
+CLOSE block_processes;
+DEALLOCATE block_processes;
+GO
+
+/***************************************************************************************/
+
+-- Clean up
+DROP TABLE #block_info;
+GO
+
+/*
+	If you have a well-behaved system and need to generate some blocking to demonstrate the script...
+
+	1.  Copy these lines to a query window and run them through the UPDATE to leave the transaction open
+	
+			USE tempdb;
+			CREATE TABLE BlockDemo (Letter CHAR(1) CONSTRAINT PK_BlockDemo PRIMARY KEY (Letter));
+			INSERT INTO BlockDemo VALUES ('A'), ('B'), ('C');
+			BEGIN TRAN
+			  UPDATE BlockDemo SET Letter = 'Q' WHERE Letter = 'B';
+			-- ROLLBACK
+
+	2.  Copy these 2 lines to a second query window and run them.  This update will be blocked by the first one.  
+
+			USE tempdb;
+			UPDATE BlockDemo SET Letter = 'Z' WHERE Letter = 'B';
+
+	3.  Run the blocking chain script to list the blocked and blocking process and the locks associated with each
+
+	4.  Clean up:   Rollback the transaction and...
+
+			USE tempdb;
+			DROP TABLE BlockDemo;
+*/
